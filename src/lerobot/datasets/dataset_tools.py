@@ -23,8 +23,10 @@ This module provides utilities for:
 - Merging datasets (wrapper around aggregate functionality)
 """
 
+import copy
 import logging
 import shutil
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -44,12 +46,19 @@ from lerobot.datasets.utils import (
     DEFAULT_DATA_FILE_SIZE_IN_MB,
     DEFAULT_DATA_PATH,
     DEFAULT_EPISODES_PATH,
+    DEFAULT_IMAGE_PATH,
+    get_file_size_in_mb,
     get_parquet_file_size_in_mb,
     load_episodes,
     update_chunk_file_indices,
     write_info,
     write_stats,
     write_tasks,
+)
+from lerobot.datasets.video_utils import (
+    concatenate_video_files,
+    encode_video_frames,
+    get_video_duration_in_s,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
@@ -270,6 +279,148 @@ def merge_datasets(
     return merged_dataset
 
 
+def reencode_images_to_videos(
+    dataset: LeRobotDataset,
+    image_keys: list[str] | None = None,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+    *,
+    vcodec: str | None = None,
+    pix_fmt: str | None = None,
+    g: int | None = None,
+    crf: int | None = None,
+    fast_decode: int = 0,
+    keep_image_folders: bool = False,
+) -> LeRobotDataset:
+    """Convert selected image features into video features and re-encode the dataset.
+
+    Args:
+        dataset: Source dataset containing image features stored as frame sequences.
+        image_keys: Optional subset of image feature names to convert. Defaults to all image keys.
+        output_dir: Destination directory for the converted dataset. Uses default cache if None.
+        repo_id: Repository identifier for the converted dataset. Defaults to ``{dataset.repo_id}_videos``.
+        vcodec: Optional video codec passed to ``encode_video_frames`` (e.g. ``"libsvtav1"``).
+        pix_fmt: Optional pixel format for encoding (e.g. ``"yuv420p"``).
+        g: Optional GOP size override.
+        crf: Optional constant rate factor override.
+        fast_decode: Optional fast decode flag forwarded to ``encode_video_frames``.
+        keep_image_folders: When True, copy the original image folders for converted keys into the new dataset.
+
+    Returns:
+        A ``LeRobotDataset`` instance pointing to the converted dataset with video features.
+    """
+
+    image_keys_to_convert = image_keys or list(dataset.meta.image_keys)
+    if not image_keys_to_convert:
+        raise ValueError("Dataset does not contain image features to convert")
+
+    invalid_keys = [key for key in image_keys_to_convert if key not in dataset.meta.image_keys]
+    if invalid_keys:
+        raise ValueError(f"Cannot convert non-image features: {invalid_keys}")
+
+    repo_id = repo_id or f"{dataset.repo_id}_videos"
+    output_dir_path = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    logging.info(
+        "Re-encoding %d image feature(s) to video for dataset '%s' -> '%s'",
+        len(image_keys_to_convert),
+        dataset.repo_id,
+        repo_id,
+    )
+
+    new_features = copy.deepcopy(dataset.meta.features)
+    for key in image_keys_to_convert:
+        feature_info = new_features.get(key)
+        if feature_info is None:
+            raise ValueError(f"Feature '{key}' not found in dataset metadata")
+        feature_info["dtype"] = "video"
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=new_features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir_path,
+        use_videos=True,
+        chunks_size=dataset.meta.chunks_size,
+        data_files_size_in_mb=dataset.meta.data_files_size_in_mb,
+        video_files_size_in_mb=dataset.meta.video_files_size_in_mb,
+    )
+
+    episode_mapping = {idx: idx for idx in range(dataset.meta.total_episodes)}
+
+    data_metadata = _copy_and_reindex_data(
+        dataset,
+        new_meta,
+        episode_mapping,
+        drop_columns=image_keys_to_convert,
+    )
+
+    existing_video_metadata: dict[int, dict] | None = None
+    if dataset.meta.video_keys:
+        existing_video_metadata = _copy_and_reindex_videos(dataset, new_meta, episode_mapping)
+
+    encode_kwargs = {}
+    if vcodec is not None:
+        encode_kwargs["vcodec"] = vcodec
+    if pix_fmt is not None:
+        encode_kwargs["pix_fmt"] = pix_fmt
+    if g is not None:
+        encode_kwargs["g"] = g
+    if crf is not None:
+        encode_kwargs["crf"] = crf
+    if fast_decode:
+        encode_kwargs["fast_decode"] = fast_decode
+
+    new_video_metadata = _encode_images_to_videos(
+        dataset,
+        new_meta,
+        episode_mapping,
+        image_keys_to_convert,
+        encode_kwargs,
+    )
+
+    video_metadata: dict[int, dict] = {}
+    if existing_video_metadata:
+        video_metadata.update(existing_video_metadata)
+    for ep_idx in episode_mapping.values():
+        video_metadata.setdefault(ep_idx, {})
+    for ep_idx, meta_dict in new_video_metadata.items():
+        video_metadata.setdefault(ep_idx, {}).update(meta_dict)
+
+    _copy_and_reindex_episodes_metadata(
+        dataset,
+        new_meta,
+        episode_mapping,
+        data_metadata,
+        video_metadata,
+    )
+
+    remaining_image_keys = [key for key in dataset.meta.image_keys if key not in image_keys_to_convert]
+    if remaining_image_keys:
+        _copy_image_directories(dataset.root, new_meta.root, remaining_image_keys)
+    if keep_image_folders and image_keys_to_convert:
+        _copy_image_directories(dataset.root, new_meta.root, image_keys_to_convert)
+
+    new_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=new_meta.root,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+        video_backend=dataset.video_backend,
+    )
+
+    logging.info(
+        "Converted dataset saved to %s with %d episodes and %d frames",
+        new_dataset.root,
+        new_dataset.meta.total_episodes,
+        new_dataset.meta.total_frames,
+    )
+
+    return new_dataset
+
+
 def modify_features(
     dataset: LeRobotDataset,
     add_features: dict[str, tuple[np.ndarray | torch.Tensor | Callable, dict]] | None = None,
@@ -470,6 +621,7 @@ def _copy_and_reindex_data(
     src_dataset: LeRobotDataset,
     dst_meta: LeRobotDatasetMetadata,
     episode_mapping: dict[int, int],
+    drop_columns: list[str] | None = None,
 ) -> dict[int, dict]:
     """Copy and filter data files, only modifying files with deleted episodes.
 
@@ -477,6 +629,7 @@ def _copy_and_reindex_data(
         src_dataset: Source dataset to copy from
         dst_meta: Destination metadata object
         episode_mapping: Mapping from old episode indices to new indices
+        drop_columns: Optional list of column names to remove from parquet data.
 
     Returns:
         dict mapping episode index to its data file metadata (chunk_index, file_index, etc.)
@@ -541,6 +694,11 @@ def _copy_and_reindex_data(
             src_ep = src_dataset.meta.episodes[first_ep_old_idx]
             chunk_idx = src_ep["data/chunk_index"]
             file_idx = src_ep["data/file_index"]
+
+        if drop_columns:
+            columns_to_drop = [col for col in drop_columns if col in df.columns]
+            if columns_to_drop:
+                df = df.drop(columns=columns_to_drop)
 
         dst_path = dst_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1012,6 +1170,140 @@ def _copy_data_with_feature_changes(
         _write_parquet(df, dst_path, new_meta)
 
     _copy_episodes_metadata_and_stats(dataset, new_meta)
+
+
+def _encode_images_to_videos(
+    src_dataset: LeRobotDataset,
+    dst_meta: LeRobotDatasetMetadata,
+    episode_mapping: dict[int, int],
+    image_keys: list[str],
+    encode_options: dict[str, object],
+) -> dict[int, dict]:
+    """Encode per-episode image sequences into sharded video files."""
+
+    if not image_keys:
+        return {}
+
+    if dst_meta.video_path is None:
+        raise ValueError("Destination metadata has no video_path defined")
+
+    if src_dataset.meta.episodes is None:
+        src_dataset.meta.episodes = load_episodes(src_dataset.meta.root)
+
+    fps = src_dataset.meta.fps
+    encode_params = dict(encode_options)
+    encode_params.setdefault("overwrite", True)
+
+    episodes_video_metadata = {new_idx: {} for new_idx in episode_mapping.values()}
+
+    for image_key in image_keys:
+        logging.info("Encoding frames for '%s' into video files", image_key)
+
+        current_chunk_idx = 0
+        current_file_idx = 0
+        current_path: Path | None = None
+        current_duration = 0.0
+        wrote_video = False
+
+        for old_idx, new_idx in tqdm(
+            sorted(episode_mapping.items(), key=lambda item: item[1]),
+            desc=f"Encoding {image_key}",
+        ):
+            frame_template = Path(
+                DEFAULT_IMAGE_PATH.format(image_key=image_key, episode_index=old_idx, frame_index=0)
+            )
+            img_dir = Path(src_dataset.root) / frame_template.parent
+            if not img_dir.exists():
+                raise FileNotFoundError(
+                    f"Expected frame directory '{img_dir}' for feature '{image_key}' does not exist"
+                )
+            if not any(img_dir.glob("frame-*.png")):
+                raise FileNotFoundError(
+                    f"No frames matching 'frame-*.png' found in '{img_dir}' for feature '{image_key}'"
+                )
+
+            temp_dir = Path(tempfile.mkdtemp())
+            temp_video_path = temp_dir / f"{image_key.replace('.', '_')}_{old_idx:06d}.mp4"
+
+            try:
+                encode_video_frames(img_dir, temp_video_path, fps, **encode_params)
+                temp_size = get_file_size_in_mb(temp_video_path)
+                episode_length = src_dataset.meta.episodes[old_idx]["length"]
+                ep_duration = (
+                    episode_length / fps if fps > 0 else get_video_duration_in_s(temp_video_path)
+                )
+
+                if current_path is None:
+                    current_chunk_idx = 0
+                    current_file_idx = 0
+                    current_path = Path(dst_meta.root) / dst_meta.video_path.format(
+                        video_key=image_key, chunk_index=current_chunk_idx, file_index=current_file_idx
+                    )
+                    current_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(temp_video_path, current_path)
+                    from_ts = 0.0
+                    to_ts = ep_duration
+                    current_duration = ep_duration
+                else:
+                    current_size = get_file_size_in_mb(current_path)
+                    if current_size + temp_size >= dst_meta.video_files_size_in_mb:
+                        current_chunk_idx, current_file_idx = update_chunk_file_indices(
+                            current_chunk_idx, current_file_idx, dst_meta.chunks_size
+                        )
+                        current_path = Path(dst_meta.root) / dst_meta.video_path.format(
+                            video_key=image_key, chunk_index=current_chunk_idx, file_index=current_file_idx
+                        )
+                        current_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(temp_video_path, current_path)
+                        from_ts = 0.0
+                        to_ts = ep_duration
+                        current_duration = ep_duration
+                    else:
+                        concatenate_video_files([current_path, temp_video_path], current_path)
+                        from_ts = current_duration
+                        current_duration += ep_duration
+                        to_ts = current_duration
+
+                wrote_video = True
+                episodes_video_metadata[new_idx].update(
+                    {
+                        f"videos/{image_key}/chunk_index": current_chunk_idx,
+                        f"videos/{image_key}/file_index": current_file_idx,
+                        f"videos/{image_key}/from_timestamp": from_ts,
+                        f"videos/{image_key}/to_timestamp": to_ts,
+                    }
+                )
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if wrote_video:
+            try:
+                dst_meta.update_video_info(image_key)
+            except FileNotFoundError as exc:
+                logging.warning("Unable to update video info for '%s': %s", image_key, exc)
+        else:
+            logging.warning("No frames were encoded for feature '%s'", image_key)
+
+    return episodes_video_metadata
+
+
+def _copy_image_directories(src_root: Path | str, dst_root: Path | str, image_keys: list[str]) -> None:
+    """Copy image frame directories for the specified keys."""
+
+    if not image_keys:
+        return
+
+    src_root = Path(src_root)
+    dst_root = Path(dst_root)
+
+    for key in image_keys:
+        src_dir = src_root / "images" / key
+        if not src_dir.exists():
+            logging.warning("Skipping copy of '%s' as directory '%s' does not exist", key, src_dir)
+            continue
+        dst_dir = dst_root / "images" / key
+        logging.info("Copying image frames for '%s' to '%s'", key, dst_dir)
+        shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
 
 
 def _copy_videos(

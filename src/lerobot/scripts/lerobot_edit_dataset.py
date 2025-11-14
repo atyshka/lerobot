@@ -18,7 +18,8 @@
 Edit LeRobot datasets using various transformation tools.
 
 This script allows you to delete episodes, split datasets, merge datasets,
-and remove features. When new_repo_id is specified, creates a new dataset.
+remove features, and convert stored image frames into encoded videos. When new_repo_id
+is specified, creates a new dataset.
 
 Usage Examples:
 
@@ -65,6 +66,13 @@ Remove camera feature:
         --operation.type remove_feature \
         --operation.feature_names "['observation.images.top']"
 
+Convert image features to video streams:
+    python -m lerobot.scripts.lerobot_edit_dataset \
+        --repo_id lerobot/pusht \
+        --operation.type reencode_images \
+        --operation.image_keys "['observation.images.wrist']" \
+        --operation.vcodec libsvtav1
+
 Using JSON config file:
     python -m lerobot.scripts.lerobot_edit_dataset \
         --config_path path/to/edit_config.json
@@ -79,6 +87,7 @@ from lerobot.configs import parser
 from lerobot.datasets.dataset_tools import (
     delete_episodes,
     merge_datasets,
+    reencode_images_to_videos,
     remove_feature,
     split_dataset,
 )
@@ -112,9 +121,21 @@ class RemoveFeatureConfig:
 
 
 @dataclass
+class ReencodeImagesConfig:
+    type: str = "reencode_images"
+    image_keys: list[str] | None = None
+    vcodec: str | None = None
+    pix_fmt: str | None = None
+    g: int | None = None
+    crf: int | None = None
+    fast_decode: int = 0
+    keep_image_folders: bool = False
+
+
+@dataclass
 class EditDatasetConfig:
     repo_id: str
-    operation: DeleteEpisodesConfig | SplitConfig | MergeConfig | RemoveFeatureConfig
+    operation: DeleteEpisodesConfig | SplitConfig | MergeConfig | RemoveFeatureConfig | ReencodeImagesConfig
     root: str | None = None
     new_repo_id: str | None = None
     push_to_hub: bool = False
@@ -258,6 +279,57 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
 
 
+def handle_reencode_images(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, ReencodeImagesConfig):
+        raise ValueError("Operation config must be ReencodeImagesConfig")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+    )
+
+    if cfg.new_repo_id is None:
+        dataset.root = Path(str(dataset.root) + "_old")
+        if dataset.meta is not None:
+            dataset.meta.root = dataset.root
+
+    logging.info(
+        "Re-encoding image features %s in dataset %s",
+        cfg.operation.image_keys or list(dataset.meta.image_keys),
+        cfg.repo_id,
+    )
+
+    new_dataset = reencode_images_to_videos(
+        dataset,
+        image_keys=cfg.operation.image_keys,
+        output_dir=output_dir,
+        repo_id=output_repo_id,
+        vcodec=cfg.operation.vcodec,
+        pix_fmt=cfg.operation.pix_fmt,
+        g=cfg.operation.g,
+        crf=cfg.operation.crf,
+        fast_decode=cfg.operation.fast_decode,
+        keep_image_folders=cfg.operation.keep_image_folders,
+    )
+
+    logging.info(
+        "Dataset saved to %s", new_dataset.root
+    )
+    logging.info(
+        "Videos created for features: %s", cfg.operation.image_keys or list(dataset.meta.image_keys)
+    )
+    logging.info(
+        "Episodes: %d, Frames: %d",
+        new_dataset.meta.total_episodes,
+        new_dataset.meta.total_frames,
+    )
+    logging.info("Video features available: %s", list(new_dataset.meta.video_keys))
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        new_dataset.push_to_hub()
+
+
 @parser.wrap()
 def edit_dataset(cfg: EditDatasetConfig) -> None:
     operation_type = cfg.operation.type
@@ -270,10 +342,12 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_merge(cfg)
     elif operation_type == "remove_feature":
         handle_remove_feature(cfg)
+    elif operation_type == "reencode_images":
+        handle_reencode_images(cfg)
     else:
         raise ValueError(
             f"Unknown operation type: {operation_type}\n"
-            f"Available operations: delete_episodes, split, merge, remove_feature"
+            f"Available operations: delete_episodes, split, merge, remove_feature, reencode_images"
         )
 
 
